@@ -1,7 +1,9 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
 .env
+.env.*
 .DS_Store
 cache/
 artifacts/
@@ -9,3 +11,11 @@ artifacts/
 *_old.py
 /accident_model.pkl
 /app_backup.py
+.streamlit/secrets.toml
+secrets*.toml
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.jks
