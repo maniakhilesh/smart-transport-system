@@ -1,0 +1,15 @@
+streamlit
+plotly
+numpy
+pandas
+scikit-learn
+joblib
+networkx
+opencv-python
+stable-baselines3
+torch
+pytest
+matplotlib
+osmnx
+folium
+streamlit-folium

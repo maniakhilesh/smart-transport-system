@@ -3,3 +3,9 @@ __pycache__/
 *.pyc
 .env
 .DS_Store
+cache/
+artifacts/
+*.docx
+*_old.py
+/accident_model.pkl
+/app_backup.py

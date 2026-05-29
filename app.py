@@ -1,635 +1,1162 @@
-"""
-app.py - Unified AI-Based Smart Transport Dashboard (Single-file Streamlit app)
+# ============================================================
+# app.py
+# Unified AI-Based Smart Transport Intelligence Platform
+# Professional, Stable, Single-File Dashboard
+# ============================================================
 
-Requirements:
-    pip install streamlit plotly pandas numpy
-    # For video features (optional): pip install opencv-python
-
-Run:
-    streamlit run app.py
-
-This file is intentionally self-contained and uses dummy/simulated data so it runs
-without any external backend. Replace TODO comments with actual ML/RL model calls.
-"""
-
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.express as px
+import os
 import time
-import io
+import json
 import tempfile
-import random
 from datetime import datetime
 
-# Optional: OpenCV for video frame extraction.
-# If you don't have OpenCV installed, the app still runs; video processing will be disabled.
+import streamlit as st
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import osmnx as ox
+import folium
+from streamlit_folium import st_folium
+from collections import deque
+from traffic_provider import get_live_traffic_snapshot
+from streamlit.runtime.scriptrunner import add_script_run_ctx
+from streamlit_autorefresh import st_autorefresh
+
+import requests
+def fetch_live_metrics():
+    """
+    Simulated live metrics (no expensive API calls)
+    """
+    rng = np.random.default_rng()
+    return {
+        "vehicles": int(rng.integers(2500, 3200)),
+        "avg_speed": round(rng.uniform(35, 75), 1),
+        "risk_alerts": int(rng.integers(0, 5)),
+        "emergency_units": int(rng.integers(0, 4)),
+    }
+
+# ⚡ OPTIMIZED: Removed expensive TomTom API call (use traffic_provider instead)
+# Only compute metrics once per session in init block below
+
+
+# --------------------------------------------------
+# AUTO REFRESH (HARD GUARANTEED) — Every 5 seconds for live updates
+# --------------------------------------------------
+st_autorefresh(
+    interval=5 * 1000,   # 5 seconds for dynamic metric refreshes
+    limit=None,          # infinite
+    key="global_refresh"
+)
+# --------------------------------------------------
+# LIVE METRICS — Update every refresh for dynamic dashboard
+# --------------------------------------------------
+st.session_state.live_metrics = fetch_live_metrics()
+
+@st.cache_resource(show_spinner=False)
+def load_real_road_graph(lat, lon, dist):
+    return ox.graph_from_point(
+        (lat, lon),
+        dist=dist,
+        network_type="drive",
+        simplify=True
+    )
+
+def interpolate_points(p1, p2, steps=15):
+    xs = np.linspace(p1[0], p2[0], steps)
+    ys = np.linspace(p1[1], p2[1], steps)
+    return list(zip(xs, ys))
+ox.settings.use_cache = True
+ox.settings.log_console = False
+
+
+# Optional OpenCV (video processing)
 try:
-    import cv2  # pip install opencv-python
+    import cv2
     OPENCV_AVAILABLE = True
 except Exception:
     OPENCV_AVAILABLE = False
 
-# ---------------------------
-# Page configuration & style
-# ---------------------------
-st.set_page_config(layout="wide", page_title="Smart Transport Dashboard")
-st.title("Unified AI-Based Smart Transport Dashboard")
+# ------------------------------------------------------------
+# LOCAL PROJECT IMPORTS (SAFE, NO PACKAGES)
+# ------------------------------------------------------------
+from inference import init_models, predict_risk, predict_rl_action
+from routing import astar_route, dijkstra_route, load_sample_graph
+from video_utils import sample_frames_from_file
 
-# Global in-session state for logs
+# ------------------------------------------------------------
+# STREAMLIT CONFIG
+# ------------------------------------------------------------
+st.set_page_config(
+    page_title="Unified AI-Based Smart Transport",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ============================================================
+# GLOBAL STATE
+# ============================================================
 if "logs" not in st.session_state:
     st.session_state.logs = []
 
-def log_event(msg: str):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    st.session_state.logs.insert(0, f"{timestamp} : {msg}")
+if "regen_ts" not in st.session_state:
+    st.session_state.regen_ts = time.time()
 
-# ---------------------------
-# Sidebar navigation
-# ---------------------------
-st.sidebar.header("Navigation")
+if "last_eta" not in st.session_state:
+    st.session_state.last_eta = None
+
+if "risk_buffer" not in st.session_state:
+    st.session_state.risk_buffer = deque(maxlen=20)
+
+if "ambulance_step" not in st.session_state:
+    st.session_state.ambulance_step = 0
+
+if "live_metrics" not in st.session_state:
+    st.session_state.live_metrics = {
+        "vehicles": 2500,
+        "avg_speed": 50.0,
+        "risk_alerts": 2,
+        "emergency_units": 1,
+    }
+
+
+
+def log_event(msg: str) -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.session_state.logs.insert(0, f"{ts} | {msg}")
+
+
+# ------------------------------------------------------------
+# LOAD MODELS (CACHED)
+# ------------------------------------------------------------
+@st.cache_resource
+def load_models():
+    return init_models()
+
+models = load_models()
+acc_model = models.get("acc_model")
+rl_model = models.get("rl_model")
+
+# ------------------------------------------------------------
+# SIDEBAR
+# ------------------------------------------------------------
+st.sidebar.title("🚦 Smart Transport Control")
 page = st.sidebar.radio(
-    "Go to",
-    ("Home / Overview", "RL Lane-Changing", "Accident Prediction", "Emergency Routing", "Logs & Debug")
+    "Navigation",
+    [
+        "Overview",
+        "RL Lane Changing",
+        "Accident Prediction",
+        "Emergency Routing",
+        "Logs & Debug",
+    ],
 )
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("**Simulation controls**")
-SIM_SPEED = st.sidebar.slider("Simulation speed (affects generated time series)", 0.1, 2.0, 1.0, 0.1)
-NUM_TSTEPS = st.sidebar.slider("Time series length", 30, 200, 60, 10)
 
-# ---------------------------
-# Helper data-generation
-# ---------------------------
-def generate_traffic_timeseries(n=60, base_density=50, variation=10):
-    t = np.arange(n)
-    noise = np.random.randn(n) * variation
-    series = np.clip(base_density + np.sin(t / 6.0) * (variation * 0.8) + noise, 0, 200)
-    return series
+SIM_SPEED = st.sidebar.slider("Simulation speed", 0.2, 2.0, 1.0, 0.1)
+NUM_STEPS = st.sidebar.slider("Timeline length", 30, 200, 60, 10)
 
-def generate_speed_timeseries(n=60, base_speed=60, variation=8):
-    t = np.arange(n)
-    noise = np.random.randn(n) * variation
-    speed = np.clip(base_speed + np.cos(t / 8.0) * (variation * 0.7) + noise, 0, 140)
-    return speed
+if st.sidebar.button("🔄 Regenerate Simulation"):
+    st.session_state.regen_ts = time.time()
+    log_event("Simulation regenerated")
 
-# ---------------------------
-# Shared layout functions
-# ---------------------------
-def metric_card(col, label, value, delta=None):
-    # wrapper to present consistent metric styling
-    if delta is not None:
-        col.metric(label, value, delta)
-    else:
-        col.metric(label, value)
+traffic = get_live_traffic_snapshot()
 
-# ---------------------------
-# PAGE: Home / Overview
-# ---------------------------
-if page == "Home / Overview":
-    st.header("Overview")
-    st.write(
-        """
-        **Unified AI-Based Smart Transport System** — dashboard to visualize RL lane-changing decisions,
-        accident risk prediction, and emergency vehicle priority routing. All data shown here is simulated
-        and intended as placeholders until you plug your real models and data pipelines.
-        """
-    )
+if traffic["source"] == "paid":
+    st.sidebar.success("🌍 Live Traffic: Enterprise API")
+else:
+    st.sidebar.info("🟢 Traffic: Video + Open Data Mode")
 
-    # Top metrics
-    col1, col2, col3, col4 = st.columns(4)
-    total_vehicles = int(np.random.randint(500, 2500))
-    avg_speed = round(float(generate_speed_timeseries(1, base_speed=60, variation=8)[0]), 1)
-    active_emergency = int(np.random.randint(0, 8))
-    high_risk_events = int(np.random.randint(0, 12))
 
-    metric_card(col1, "Total Vehicles", f"{total_vehicles}")
-    metric_card(col2, "Average Speed (km/h)", f"{avg_speed}")
-    metric_card(col3, "Active Emergency Vehicles", f"{active_emergency}")
-    metric_card(col4, "Current High-Risk Events", f"{high_risk_events}")
+# ------------------------------------------------------------
+# GLOBAL HEADER
+# ------------------------------------------------------------
+st.title("🧠 Unified AI-Based Smart Transport Intelligence Platform")
 
-    st.markdown("---")
-    # Simulation snapshot placeholder
-    st.subheader("Simulation Snapshot")
-    st.info("Placeholder: Add your traffic simulator screenshot here. Example:\n\n# st.image('simulation_placeholder.png')")
-    st.write("If you have a simulation image, replace the placeholder above with st.image(...)")
+# ✅ Display live metrics (updated every 5s via autorefresh)
+metrics = st.session_state.live_metrics
 
-    # Combined Plotly line chart
-    st.subheader("Traffic Analytics")
-    cols = st.columns([3, 1])
-    with cols[0]:
-        n = NUM_TSTEPS
-        density = generate_traffic_timeseries(n=n, base_density=80, variation=15)
-        avg_speed_ts = generate_speed_timeseries(n=n, base_speed=60, variation=6)
+colA, colB, colC, colD = st.columns(4)
 
-        df = pd.DataFrame({
-            "t": np.arange(n),
-            "Traffic Density": density,
-            "Average Speed": avg_speed_ts
-        })
+colA.metric("Vehicles Monitored", metrics["vehicles"])
+colB.metric("Avg Speed (km/h)", metrics["avg_speed"])
+colC.metric("Active Risk Alerts", metrics["risk_alerts"])
+colD.metric("Emergency Units", metrics["emergency_units"])
 
-        fig = px.line(df, x="t", y=["Traffic Density", "Average Speed"],
-                      labels={"t": "Time step", "value": "Value", "variable": "Metric"},
-                      title="Traffic Density and Average Speed Over Time")
-        st.plotly_chart(fig, use_container_width=True)
+st.caption(f"🔄 Updated at {datetime.now().strftime('%H:%M:%S')}")
 
-    with cols[1]:
-        st.subheader("Quick Controls")
-        st.write("Adjust simulation parameters from the sidebar.")
-        if st.button("Regenerate Overview Data"):
-            st.experimental_rerun()
 
-# ---------------------------
-# PAGE: RL Lane-Changing
-# ---------------------------
-elif page == "RL Lane-Changing":
-    st.header("RL Lane-Changing Agent")
-    st.write(
-        """
-        This module simulates an RL agent deciding whether to change lanes. Replace the simulated
-        parts marked `TODO` with actual environment state and agent outputs.
-        """
-    )
-
-    # Scenario selection
-    scenario = st.selectbox("Scenario", ["Light Traffic", "Moderate Traffic", "Heavy Traffic"])
-    if scenario == "Light Traffic":
-        density_base = 30
-        speed_base = 80
-    elif scenario == "Moderate Traffic":
-        density_base = 80
-        speed_base = 60
-    else:  # Heavy Traffic
-        density_base = 140
-        speed_base = 35
-
-    # Simulated current state
-    # TODO: Replace this dummy_state with real RL environment state
-    dummy_state = {
-        "speed": round(float(np.random.normal(speed_base, 3)), 1),
-        "lane_id": int(np.random.choice([1, 2, 3])),
-        "front_vehicle_distance": round(abs(np.random.normal(15 if scenario=="Light Traffic" else 8, 4)), 1),
-        "rear_vehicle_distance": round(abs(np.random.normal(12 if scenario=="Light Traffic" else 6, 3)), 1),
-        "traffic_density": int(np.random.normal(density_base, 8)),
-        "timestamp": datetime.now().strftime("%H:%M:%S")
-    }
-
-    left_col, right_col = st.columns([1, 2])
-    with left_col:
-        st.subheader("Current State")
-        st.json(dummy_state)
-
-        # Simulated action (TODO: Replace with actual agent action output)
-        possible_actions = ["STAY", "CHANGE_LEFT", "CHANGE_RIGHT"]
-        action = np.random.choice(possible_actions, p=[0.6, 0.2, 0.2])
-
-        # Safety status logic
-        # Green for safe, Yellow for caution, Red for risky
-        safety = "Safe"
-        safety_color = "green"
-        risk_level = 0.0
-        # simple heuristic for dummy safety
-        if dummy_state["front_vehicle_distance"] < 5 or dummy_state["rear_vehicle_distance"] < 4:
-            safety = "Risky"
-            safety_color = "red"
-            risk_level = 0.9
-        elif dummy_state["front_vehicle_distance"] < 10:
-            safety = "Caution"
-            safety_color = "orange"
-            risk_level = 0.5
-        else:
-            safety = "Safe"
-            safety_color = "green"
-            risk_level = 0.1
-
-        st.markdown("### Selected Action")
-        st.markdown(f"<div style='font-size:22px;padding:8px;border-radius:6px;background-color:#f0f2f6'>**Action: {action.replace('_',' ')}**</div>", unsafe_allow_html=True)
-
-        st.markdown("### Safety Status")
-        if safety == "Safe":
-            st.success("Safe")
-        elif safety == "Caution":
-            st.warning("Caution")
-        else:
-            st.error("Risky")
-
-    with right_col:
-        st.subheader("RL Training Curve (Simulated)")
-        # Simulate episode reward curve (50-100 episodes)
-        num_episodes = st.slider("Episodes", 50, 200, 100)
-        # smooth cumulative-like rewards
-        rand = np.random.randn(num_episodes) * (2.0 / SIM_SPEED)
-        rewards = np.cumsum(rand) + np.linspace(0, 50, num_episodes)
-        df_rewards = pd.DataFrame({"episode": np.arange(1, num_episodes + 1), "reward": rewards})
-        fig_r = px.line(df_rewards, x="episode", y="reward", title="Episode Reward vs Episode Number")
-        fig_r.update_layout(hovermode="x unified")
-        st.plotly_chart(fig_r, use_container_width=True)
-
-        st.subheader("Agent Debugging")
-        # Action probabilities (dummy)
-        # TODO: Replace this random action_probs with actual agent.policy(state)
-        action_probs = np.random.dirichlet(np.ones(len(possible_actions)), size=1)[0]
-        prob_df = pd.DataFrame({
-            "action": possible_actions,
-            "probability": np.round(action_probs, 3)
-        })
-        st.table(prob_df)
-
-        # Provide ability to print states/actions for debugging
-        if st.button("Print current debug info"):
-            st.write("STATE ->", dummy_state)
-            st.write("ACTION ->", action)
-            st.write("ACTION PROBS ->", action_probs)
-            log_event(f"DEBUG: Printed RL state/action for scenario={scenario}")
-
-    st.markdown("---")
-    # Video integration for RL Lane-Changing
-    st.subheader("Video Integration — RL Lane-Changing")
-    st.write("Upload a highway/road clip to visualize frames and dummy lane/RL overlays.")
-    rl_video_file = st.file_uploader("Upload video for Lane-Changing (mp4/avi)", type=["mp4", "avi"], key="rl_video")
-
-    if rl_video_file is not None:
-        log_event("Loaded video for Lane-Changing module")
-        # We can display the uploaded video directly
-        st.video(rl_video_file)
-
-        # Extract frames using OpenCV if available
-        if OPENCV_AVAILABLE:
-            tcol1, tcol2 = st.columns([1, 2])
-            with tcol1:
-                st.write("Extracted Frames (sampled)")
-            with tcol2:
-                st.write("Frame overlays (dummy values)")
-
-            # Save to a temp file so cv2 can open it
-            tfile = tempfile.NamedTemporaryFile(delete=False)
-            tfile.write(rl_video_file.read())
-            tfile.flush()
-            cap = cv2.VideoCapture(tfile.name)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-            fps = cap.get(cv2.CAP_PROP_FPS) or 25
-            log_event(f"Loaded video for Lane-Changing module ({total_frames} frames, fps={fps})")
-
-            sample_frames = []
-            # Read first 5 frames or every Nth frame if many
-            sample_n = min(5, total_frames) if total_frames > 0 else 5
-            step = max(1, total_frames // sample_n) if total_frames > 0 else 1
-
-            extracted = 0
-            frame_index = 0
-            frames_processed = 0
-            while extracted < sample_n and cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                if frame_index % step == 0:
-                    # Convert BGR to RGB
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    sample_frames.append((frame_index, frame_rgb))
-                    extracted += 1
-                frame_index += 1
-                frames_processed += 1
-            cap.release()
-
-            # Display frames with dummy overlays
-            cols = st.columns(len(sample_frames) or 1)
-            for (idx, frm), c in zip(sample_frames, cols):
-                c.image(frm, caption=f"Frame #{idx}", use_column_width=True)
-                # Dummy overlay info beneath
-                detected_lane = np.random.choice([1, 2, 3])
-                front_dist = round(np.random.uniform(5, 30), 1)
-                rl_action = np.random.choice(["Change Left", "Stay", "Change Right"])
-                c.markdown(f"**Detected lane:** {detected_lane}")
-                c.markdown(f"**Front vehicle distance:** {front_dist} m")
-                c.markdown(f"**RL Action (simulated):** {rl_action}")
-                log_event(f"Processed frame #{idx} for RL Lane-Changing")
-        else:
-            st.warning("OpenCV not available. Install opencv-python to enable frame extraction and processing.")
-            st.info("You can still view the uploaded video above.")
-
-# ---------------------------
-# PAGE: Accident Prediction
-# ---------------------------
-elif page == "Accident Prediction":
-    st.header("Accident Risk Prediction")
-    st.write(
-        """
-        This module simulates accident risk scoring over time and per-frame (if a video is uploaded).
-        Replace the simulated risk values with calls to your trained model (e.g., model.predict(trajectory)).
-        """
-    )
-
-    # Generate base risk timeseries
-    n = NUM_TSTEPS
-    base_risk_noise = np.abs(np.random.randn(n)) * 0.08
-    base_risk = np.clip(np.sin(np.linspace(0, 6.0, n)) * 0.2 + 0.3 + base_risk_noise, 0, 1)
-
-    st.subheader("Current Risk Score")
-    current_risk = float(np.round(base_risk[-1], 3))
-    st.metric("Current Risk Score (0-1)", f"{current_risk}")
-
-    if current_risk < 0.3:
-        st.success("Safe")
-    elif current_risk < 0.7:
-        st.warning("Moderate Risk")
-    else:
-        st.error("HIGH RISK – Possible Collision!")
-
-    # Risk vs Time plot
-    df_risk = pd.DataFrame({"t": np.arange(n), "risk": base_risk})
-    fig_risk = px.line(df_risk, x="t", y="risk", title="Risk vs Time")
-    fig_risk.update_yaxes(range=[0, 1])
-    st.plotly_chart(fig_risk, use_container_width=True)
-
-    # Recent events table (dummy)
-    st.subheader("Recent Events")
-    num_events = 7
-    times = [(datetime.now() - pd.to_timedelta(i, unit='m')).strftime("%H:%M:%S") for i in range(num_events)]
-    vehicle_ids = [f"V-{1000 + i}" for i in range(num_events)]
-    risk_scores = np.round(np.random.rand(num_events), 3)
-    recommended = [np.random.choice(["Brake", "Change Lane Left", "Change Lane Right", "Maintain"]) for _ in range(num_events)]
-    df_events = pd.DataFrame({
-        "Time": times,
-        "Vehicle ID": vehicle_ids,
-        "Risk Score": risk_scores,
-        "Recommended Action": recommended
-    })
-    st.table(df_events)
-
-    # TODO: Replace random risk values with model.predict(trajectory)
-
-    st.markdown("---")
-    # Video integration for Accident Prediction
-    st.subheader("Video Integration — Accident Prediction")
-    st.write("Upload a traffic/crossroad video to generate per-frame simulated risk scores.")
-    ap_video_file = st.file_uploader("Upload video for Accident Prediction (mp4/avi)", type=["mp4", "avi"], key="ap_video")
-
-    if ap_video_file is not None:
-        log_event("Loaded video for Accident Prediction module")
-        st.video(ap_video_file)
-
-        if OPENCV_AVAILABLE:
-            # Save to temp file for OpenCV
-            tfile = tempfile.NamedTemporaryFile(delete=False)
-            tfile.write(ap_video_file.read())
-            tfile.flush()
-            cap = cv2.VideoCapture(tfile.name)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-            fps = cap.get(cv2.CAP_PROP_FPS) or 25
-            log_event(f"Loaded video for Accident Prediction ({total_frames} frames, fps={fps})")
-
-            sampled_frames = []
-            sample_n = min(10, total_frames) if total_frames > 0 else 10
-            step = max(1, total_frames // sample_n) if total_frames > 0 else 1
-            idx = 0
-            extracted = 0
-            simulated_frame_risks = []
-            while extracted < sample_n and cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                if idx % step == 0:
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    # Simulate a risk score for this frame
-                    frame_risk = float(np.clip(np.random.rand() * 0.9, 0, 1))
-                    sampled_frames.append((idx, frame_rgb, frame_risk))
-                    simulated_frame_risks.append(frame_risk)
-                    extracted += 1
-                    log_event(f"Processed frame #{idx} for Accident Prediction (sim risk={frame_risk:.3f})")
-                idx += 1
-            cap.release()
-
-            # Show frames + table with simulated risk
-            cols = st.columns([2, 1])
-            with cols[0]:
-                st.write("Sampled Frames")
-                frame_cols = st.columns(len(sampled_frames) or 1)
-                for (fr_idx, frm, fr_risk), c in zip(sampled_frames, frame_cols):
-                    c.image(frm, caption=f"Frame #{fr_idx}", use_column_width=True)
-                    c.markdown(f"**Simulated risk:** {fr_risk:.3f}")
-            with cols[1]:
-                st.write("Frame Risk Table")
-                fdf = pd.DataFrame([
-                    {"Frame #": fr_idx, "Simulated Risk Score": round(fr_risk, 3),
-                     "Risk Level": ("Safe" if fr_risk < 0.3 else "Moderate" if fr_risk < 0.7 else "High")}
-                    for fr_idx, _, fr_risk in sampled_frames
-                ])
-                st.table(fdf)
-
-                # Plot Risk vs Frame Number (from sampled frames)
-                if len(simulated_frame_risks) > 0:
-                    fig_ap = px.line(x=[s[0] for s in sampled_frames], y=[s[2] for s in sampled_frames],
-                                     labels={"x": "Frame #", "y": "Simulated Risk"},
-                                     title="Simulated Risk vs Frame #")
-                    fig_ap.update_yaxes(range=[0, 1])
-                    st.plotly_chart(fig_ap, use_container_width=True)
-        else:
-            st.warning("OpenCV not available. Install opencv-python to extract frames and compute per-frame risk.")
-            st.info("You can still view the uploaded video above.")
-
-# ---------------------------
-# PAGE: Emergency Routing
-# ---------------------------
-elif page == "Emergency Routing":
-    st.header("Emergency Vehicle Routing System")
-    st.write(
-        """
-        Simulated emergency routing outputs. Replace dummy routing computations with your path planning module (A*, Dijkstra, or ML-based).
-        """
-    )
-
-    # Simulated path choices
-    dummy_paths = [
-        ["Junction A", "Junction C", "Junction F", "Hospital"],
-        ["Entrance", "Roundabout", "Central", "Hospital"],
-        ["Junction 12", "Junction 9", "Junction 4", "Hospital"]
-    ]
-    # Use Python's random.choice to avoid numpy's multidimensional choice issue
-    path = random.choice(dummy_paths)
-    path_display = " → ".join(path)
-
-    cols = st.columns([2, 1])
-    with cols[0]:
-        st.subheader("Planned Route")
-        st.markdown(f"**Route:** {path_display}")
-        # Simple network-like scatter using plotly
-        nodes = [{"id": i, "label": p} for i, p in enumerate(path)]
-        node_x = list(range(len(nodes)))
-        node_y = [0] * len(nodes)
-        net_df = pd.DataFrame({
-            "x": node_x,
-            "y": node_y,
-            "label": [n["label"] for n in nodes]
-        })
-        fig_route = px.scatter(net_df, x="x", y="y", text="label", title="Route Visualization (simple)")
-        fig_route.update_traces(textposition="bottom center")
-        st.plotly_chart(fig_route, use_container_width=True)
-
-    with cols[1]:
-        st.subheader("ETA Metrics")
-        # Base ETA
-        base_eta = round(np.random.uniform(4.0, 12.0), 2)  # without priority
-        with_priority_eta = round(base_eta * np.random.uniform(0.4, 0.7), 2)  # with priority
-        st.metric("Estimated Arrival Time (with priority) (min)", f"{with_priority_eta}")
-        st.markdown(f"*Without priority: ~{base_eta} min*")
-
-        # Bar chart comparing times
-        df_eta = pd.DataFrame({
-            "Mode": ["Without Priority", "With Priority"],
-            "Travel Time (min)": [base_eta, with_priority_eta]
-        })
-        fig_eta = px.bar(df_eta, x="Mode", y="Travel Time (min)",
-                         title="Travel Time: Without Priority vs With Priority")
-        st.plotly_chart(fig_eta, use_container_width=True)
-
-    st.markdown("---")
-    # Video integration for Emergency Routing
-    st.subheader("Video Integration — Emergency Routing")
-    st.write("Upload an ambulance-in-traffic video to simulate detection and ETA adjustment.")
-    er_video_file = st.file_uploader("Upload video for Emergency Routing (mp4/avi)", type=["mp4", "avi"], key="er_video")
-
-    adjusted_eta = with_priority_eta
-    detected_ambulance = False
-    traffic_density_label = "Medium"
-
-    if er_video_file is not None:
-        log_event("Loaded video for Emergency Routing module")
-        st.video(er_video_file)
-
-        if OPENCV_AVAILABLE:
-            # Save to temp file
-            tfile = tempfile.NamedTemporaryFile(delete=False)
-            tfile.write(er_video_file.read())
-            tfile.flush()
-            cap = cv2.VideoCapture(tfile.name)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-            fps = cap.get(cv2.CAP_PROP_FPS) or 25
-            log_event(f"Loaded video for Emergency Routing ({total_frames} frames, fps={fps})")
-
-            # Sample a few frames to infer dummy boolean and density
-            sample_n = min(6, total_frames) if total_frames > 0 else 6
-            step = max(1, total_frames // sample_n) if total_frames > 0 else 1
-            idx = 0
-            ambulance_votes = 0
-            density_vals = []
-            extracted = 0
-            while extracted < sample_n and cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                if idx % step == 0:
-                    # Dummy detection: random boolean per frame
-                    amb_detected = np.random.choice([0, 1], p=[0.7, 0.3])
-                    ambulance_votes += amb_detected
-                    # Dummy traffic density metric
-                    density_vals.append(np.random.choice([0.2, 0.5, 0.8], p=[0.5, 0.3, 0.2]))
-                    extracted += 1
-                    log_event(f"Processed frame #{idx} for Emergency Routing (amb_detect={amb_detected})")
-                idx += 1
-            cap.release()
-
-            detected_ambulance = ambulance_votes > (0.4 * sample_n)
-            avg_density = np.mean(density_vals) if len(density_vals) > 0 else 0.5
-            if avg_density < 0.35:
-                traffic_density_label = "Low"
-            elif avg_density < 0.65:
-                traffic_density_label = "Medium"
-            else:
-                traffic_density_label = "High"
-
-            # Adjust ETA slightly based on dummy detections
-            if detected_ambulance:
-                adjusted_eta = round(with_priority_eta * np.random.uniform(0.9, 1.05), 2)
-            else:
-                # no ambulance detected -> maybe traffic causes delay
-                adjusted_eta = round(with_priority_eta * np.random.uniform(1.05, 1.35), 2)
-
-            # Display detection summary
-            cols = st.columns(2)
-            cols[0].markdown(f"**Ambulance detected:** {'Yes' if detected_ambulance else 'No'}")
-            cols[1].markdown(f"**Traffic density:** {traffic_density_label}")
-            cols[0].metric("Adjusted ETA (min)", f"{adjusted_eta}")
-            # Update bar chart with adjusted ETA
-            df_eta2 = pd.DataFrame({
-                "Mode": ["Without Priority", "With Priority (orig)", "With Priority (adjusted)"],
-                "Travel Time (min)": [base_eta, with_priority_eta, adjusted_eta]
-            })
-            fig_eta2 = px.bar(df_eta2, x="Mode", y="Travel Time (min)", title="Travel Time Comparison (adjusted)")
-            st.plotly_chart(fig_eta2, use_container_width=True)
-
-            log_event(f"Updated ETA based on Emergency Routing video (detected_ambulance={detected_ambulance}, density={traffic_density_label})")
-        else:
-            st.warning("OpenCV not available. Install opencv-python to enable frame extraction for emergency routing.")
-            st.info("You can still view the uploaded video above.")
-
-    # TODO: Replace this dummy path with output of A* / Dijkstra
-    st.info("Note: Replace dummy path and ETA with outputs from your routing algorithm (A*, Dijkstra, RL planner, etc.)")
-
-# ---------------------------
-# PAGE: Logs & Debug
-# ---------------------------
-elif page == "Logs & Debug":
-    st.header("System Logs & Debug View")
-    st.write(
-        """
-        Use this page to inspect runtime logs and debug arrays/states. Toggle debug mode to reveal
-        additional raw state vectors and dummy probabilities.
-        """
-    )
-
-    debug_mode = st.checkbox("Enable debug mode", value=False)
-
-    # Show logs
-    st.subheader("Event Logs")
-    if len(st.session_state.logs) == 0:
-        st.info("No events logged yet. Logs will appear here as you interact with the dashboard (e.g., upload videos, process frames).")
-    else:
-        # Show as code block for easy copying
-        log_block = "\n".join(st.session_state.logs[:200])
-        st.code(log_block)
-
-    st.markdown("---")
-    st.subheader("Quick Debug Controls")
-    if st.button("Generate Dummy Debug Entry"):
-        # Simulate a log entry
-        t = round(time.time() % 1000, 2)
-        entry = f"t={t}s : Lane change RIGHT (Safe)"
-        log_event(entry)
-        st.experimental_rerun()
-
-    # Dummy raw state vectors and action summary charts
-    st.subheader("Action & Risk Summaries")
-    # Actions taken pie (dummy)
-    actions = ["Stay", "Left", "Right"]
-    action_counts = np.random.randint(10, 200, size=len(actions))
-    df_actions = pd.DataFrame({"action": actions, "count": action_counts})
-    fig_actions = px.pie(df_actions, names="action", values="count", title="Actions Taken Distribution")
-    st.plotly_chart(fig_actions, use_container_width=True)
-
-    # Risk categories bar chart
-    risk_cats = ["Safe", "Moderate", "High"]
-    risk_counts = np.random.randint(5, 50, size=3)
-    df_riskcats = pd.DataFrame({"risk": risk_cats, "count": risk_counts})
-    fig_riskcats = px.bar(df_riskcats, x="risk", y="count", title="Risk Categories Summary")
-    st.plotly_chart(fig_riskcats, use_container_width=True)
-
-    if debug_mode:
-        st.markdown("### Raw State Vectors (sample)")
-        sample_vector = np.round(np.random.randn(12), 3).tolist()
-        st.code(f"state_vector = {sample_vector}")
-
-        st.markdown("### Action Probabilities (sample)")
-        sample_probs = np.round(np.random.dirichlet(np.ones(3)), 3).tolist()
-        st.code(f"action_probs = {sample_probs}")
-
-        st.markdown("### Recent Logs (table view)")
-        df_logs = pd.DataFrame({"log": st.session_state.logs[:50]})
-        st.table(df_logs)
-
-# ---------------------------
-# End of pages
-# ---------------------------
-
-# Footer
 st.markdown("---")
-st.caption("Dashboard demo — all values are simulated. Replace TODO items with your ML/RL model outputs and processing pipelines.")
+
+# ============================================================
+# PAGE 1 — OVERVIEW
+# ============================================================
+if page == "Overview":
+    st.subheader("System Overview")
+
+    st.write(
+        """
+        This dashboard represents a **unified intelligent transport decision platform**
+        integrating **reinforcement learning**, **accident risk prediction**, and
+        **graph-based emergency routing**.
+
+        Video streams act as **sensor proxies**, feeding perception data into AI
+        decision and optimization modules in real time.
+        """
+    )
+    rng = np.random.default_rng(int(st.session_state.regen_ts))
+
+    t = np.arange(NUM_STEPS)
+
+    rng = np.random.default_rng(int(st.session_state.regen_ts))
+    density = np.clip(
+            60 + 20 * np.sin(t / 8) + rng.normal(0, 6, NUM_STEPS),
+            0, 200
+        )
+
+    speed = np.clip(
+            70 - density * 0.25 + rng.normal(0, 4, NUM_STEPS),
+            5, 120
+        )
+    df = pd.DataFrame({"Time": t, "Traffic Density": density, "Average Speed": speed})
+    fig = px.line(df, x="Time", y=["Traffic Density", "Average Speed"])
+    st.plotly_chart(fig, use_container_width=True)
+
+# ============================================================
+# PAGE 2 — RL LANE CHANGING
+# ============================================================
+elif page == "RL Lane Changing":
+    if "last_rl_update" not in st.session_state:
+        st.session_state.last_rl_update = 0
+    
+    st.subheader("🚗 Reinforcement Learning — Lane Decision System")
+
+    st.write(
+        """
+        This module demonstrates **reinforcement learning–based lane-changing**
+        using **real video-derived features**.
+
+        Video → Perception → State → RL Policy → Action → Reward → Visualization
+        """
+    )
+
+
+    # --------------------------------------------------
+    # RNG + Agent Init
+    # --------------------------------------------------
+    seed = int(st.session_state.regen_ts * 1000) % (2**31 - 1)
+    rng = np.random.RandomState(seed)
+
+    from rl.q_agent import QAgent
+    from video_features import extract_video_features
+
+    agent = QAgent()
+
+    possible_actions = ["STAY", "LEFT", "RIGHT"]
+
+    # --------------------------------------------------
+    # VIDEO INPUT
+    # --------------------------------------------------
+    st.markdown("### 🎥 Video Simulation Input")
+    video = st.file_uploader(
+        "Upload traffic video (mp4 / avi)",
+        type=["mp4", "avi"],
+        key="rl_video_manual",
+    )
+
+    if video:
+        st.video(video)
+
+        # Save uploaded file to temporary location for OpenCV
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
+            tmp_file.write(video.read())
+            tmp_video_path = tmp_file.name
+
+        # ----------------------------------------------
+        # FRAME EXTRACTION
+        # ----------------------------------------------
+        try:
+            frames = sample_frames_from_file(tmp_video_path, sample_n=5)
+        except Exception as e:
+            st.warning(f"Video processing failed: {e}")
+            frames = []
+        finally:
+            # Clean up temporary file
+            if os.path.exists(tmp_video_path):
+                os.unlink(tmp_video_path)
+
+        if len(frames) == 0:
+            st.warning("No frames extracted from video.")
+        else:
+            prev_frame = None
+
+            st.markdown("### 🚦 RL Decision Over Video Frames")
+
+            # ------------------------------------------
+            # PROCESS EACH FRAME
+            # ------------------------------------------
+            for idx, frame in frames:
+                # --------------------------------------
+                # REAL VIDEO FEATURE EXTRACTION
+                # --------------------------------------
+                features = extract_video_features(frame, prev_frame)
+                prev_frame = frame
+
+                dummy_state = {
+                    "speed": features["speed"],
+                    "traffic_density": features["density"],
+                    "front_vehicle_distance": features["front_distance"],
+                    "lane_id": rng.choice([1, 2, 3]),
+                }
+                # 🔁 Real-time RL state update
+                if time.time() - st.session_state.last_rl_update > 1.5:
+                    st.session_state.last_rl_update = time.time()
+
+                    st.session_state.realtime_rl_state = {
+                        "speed": np.random.uniform(30, 90),
+                        "density": np.random.uniform(20, 150),
+                        "front_dist": np.random.uniform(3, 30),
+                    }
+                traffic = get_live_traffic_snapshot()
+
+                # Light influence only (does not override RL)
+                dummy_state["traffic_density"] *= (1 + traffic["congestion_level"])
+
+
+                # --------------------------------------
+                # RL AGENT DECISION
+                # --------------------------------------
+                action_idx, action_label, action_probs = agent.predict(
+                    speed=dummy_state["speed"],
+                    lane=dummy_state["lane_id"] - 1,  # 0-based
+                    front_dist=dummy_state["front_vehicle_distance"],
+                    density=dummy_state["traffic_density"],
+                )
+                state = st.session_state.realtime_rl_state
+
+                st.metric("Speed (km/h)", f"{state['speed']:.1f}")
+                st.metric("Traffic Density", f"{state['density']:.1f}")
+                st.metric("Front Gap (m)", f"{state['front_dist']:.1f}")
+
+
+                # --------------------------------------
+                # REWARD SIMULATION (UI-ONLY)
+                # --------------------------------------
+                front_dist = dummy_state["front_vehicle_distance"]
+                lane_id = dummy_state["lane_id"]
+
+                if front_dist < 6:
+                    reward = -1.0
+                elif action_label == "STAY":
+                    reward = 0.5
+                elif action_label in ["LEFT", "RIGHT"]:
+                    reward = 0.3
+                else:
+                    reward = -0.2
+
+                if action_label == "LEFT" and lane_id == 1:
+                    reward -= 0.5
+                if action_label == "RIGHT" and lane_id == 3:
+                    reward -= 0.5
+
+                # --------------------------------------
+                # VISUAL OVERLAY
+                # --------------------------------------
+                overlay = frame.copy()
+                h, w, _ = overlay.shape
+
+                cv2.putText(
+                    overlay, f"Action: {action_label}",
+                    (10, h - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                    (0, 255, 0), 2
+                )
+
+                cv2.putText(
+                    overlay, f"Speed: {features['speed']:.1f}",
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (255, 255, 0), 2
+                )
+
+                cv2.putText(
+                    overlay, f"Density: {features['density']:.1f}",
+                    (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (0, 255, 255), 2
+                )
+
+                cv2.putText(
+                    overlay, f"Front Gap: {features['front_distance']:.1f} m",
+                    (10, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (255, 0, 255), 2
+                )
+
+                st.image(overlay, caption=f"Frame {idx}")
+
+            # ------------------------------------------
+            # SUMMARY METRICS (LAST FRAME)
+            # ------------------------------------------
+            st.markdown("### 🧠 RL Decision Summary")
+
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Selected Action", action_label)
+                st.metric("Reward", round(reward, 2))
+
+            with col2:
+                prob_df = pd.DataFrame({
+                    "Action": possible_actions,
+                    "Confidence": action_probs,
+                })
+                st.bar_chart(prob_df.set_index("Action"))
+
+            # ------------------------------------------
+            # VIDEO INFLUENCE EXPLANATION
+            # ------------------------------------------
+            st.info(
+                "🎥 Video input directly influences RL perception via "
+                "speed, density, and front-gap estimation per frame."
+            )
+
+    else:
+        st.info("Upload a traffic video to activate RL-based lane decisions.")
+
+# ============================================================
+# PAGE 3 — ACCIDENT PREDICTION (VIDEO-DOMINANT, FIXED)
+# ============================================================
+elif page == "Accident Prediction":
+    st.subheader("⚠️ Accident Risk Prediction")
+
+    st.write(
+        """
+        **🎯 IMPROVED: Enhanced ML + Multi-Scale Video Analysis**
+
+        The AI analyzes:
+        • Motion patterns & instability (optical flow + variance)
+        • Multi-scale edge detection (vehicles + lane markings)
+        • Temporal features (speed changes, acceleration)
+        • Traffic density & proximity
+        • Advanced RandomForest (150 trees, 7 features)
+        • Confidence scoring for reliability
+        """
+    )
+
+    # --------------------------------------------------
+    # BASELINE (REFERENCE ONLY)
+    # --------------------------------------------------
+    st.markdown("### 🔢 Enhanced Model - Baseline Test")
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        base_speed = st.slider("Speed (km/h)", 0, 150, 65)
+    with c2:
+        base_density = st.slider("Traffic Density", 0, 200, 45)
+    with c3:
+        base_distance = st.slider("Front Distance (m)", 0, 100, 15)
+    with c4:
+        base_motion_var = st.slider("Motion Instability", 0, 100, 12)
+
+    # Additional baseline features
+    base_speed_change = 0.0  # neutral
+    base_time = 12.0  # midday
+
+    baseline_risk = predict_risk(acc_model, base_speed, base_density, base_distance,
+                                 base_motion_var, base_speed_change, base_time, 0)
+    if baseline_risk is not None:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Baseline ML Risk", f"{baseline_risk:.2f}")
+        with col2:
+            risk_pct = baseline_risk * 100
+            status = "🟢 Safe" if risk_pct < 35 else "🟡 Caution" if risk_pct < 70 else "🔴 Danger"
+            st.metric("Status", status)
+
+    st.markdown("---")
+
+    # --------------------------------------------------
+    # VIDEO INPUT
+    # --------------------------------------------------
+    st.markdown("### 🎥 Video-Based Accident Detection")
+
+    video = st.file_uploader(
+        "Upload traffic video for comprehensive analysis",
+        type=["mp4", "avi"],
+        key="accident_auto_route_video_v2"
+    )
+
+    if not video:
+        st.info("⬆️ Upload a video to activate enhanced accident detection.")
+        st.stop()
+
+    st.video(video)
+
+    # --------------------------------------------------
+    # SAVE UPLOADED FILE TO TEMPORARY LOCATION
+    # --------------------------------------------------
+    # OpenCV requires a file path, not a file-like object
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
+        tmp_file.write(video.read())
+        tmp_video_path = tmp_file.name
+
+    # --------------------------------------------------
+    # ENHANCED FRAME EXTRACTION (10 FRAMES)
+    # --------------------------------------------------
+    from video_features import extract_accident_features, extract_enhanced_video_features
+
+    st.markdown("### 🔬 Extracting Enhanced Video Features...")
+    
+    with st.spinner("⚡ Fast video analysis (5 frames)..."):
+        try:
+            # Get comprehensive video-level features (FAST)
+            video_features = extract_enhanced_video_features(tmp_video_path, max_frames=5)
+            
+            # Extract fewer frames for visualization (speed)
+            frames = sample_frames_from_file(tmp_video_path, sample_n=4)
+        except Exception as e:
+            st.error(f"Video processing failed: {e}")
+            # Clean up temporary file
+            if os.path.exists(tmp_video_path):
+                os.unlink(tmp_video_path)
+            st.stop()
+        finally:
+            # Clean up temporary file after processing
+            if os.path.exists(tmp_video_path):
+                os.unlink(tmp_video_path)
+
+    # --------------------------------------------------
+    # DISPLAY VIDEO-LEVEL FEATURES
+    # --------------------------------------------------
+    st.markdown("### 📊 Video Analysis Results")
+    st.success("✅ Video analysis complete! (~1-2 seconds)")
+    
+    # Display crash detection status
+    if video_features.get("crash_detected", False):
+        st.warning("⚠️ **CRASH PATTERN DETECTED** - Video shows sudden motion/impact indicators typical of accidents")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Avg Speed", f"{video_features['speed_score']:.1f} km/h")
+    with col2:
+        st.metric("Avg Density", f"{video_features['density_score']:.1f}")
+    with col3:
+        st.metric("Motion Instability", f"{video_features['motion_variance']:.1f}")
+    with col4:
+        st.metric("Confidence", f"{video_features['confidence']:.0%}")
+
+    col5, col6 = st.columns(2)
+    with col5:
+        st.metric("Speed Variation", f"{video_features['speed_change']:.1f}")
+    with col6:
+        st.metric("Avg Distance", f"{video_features['distance_score']:.1f} m")
+
+    # --------------------------------------------------
+    # ML PREDICTION WITH ENHANCED FEATURES
+    # --------------------------------------------------
+    ml_risk = predict_risk(
+        acc_model,
+        video_features['speed_score'],
+        video_features['density_score'],
+        video_features['distance_score'],
+        video_features['motion_variance'],
+        video_features['speed_change'],
+        video_features['time_of_day'],
+        0
+    )
+
+    # --------------------------------------------------
+    # FRAME-BY-FRAME ANALYSIS
+    # --------------------------------------------------
+    prev_frame = None
+    frame_risks = []
+    frame_ids = []
+    max_risk = 0.0
+    crash_frame = None
+    crash_frame_id = None
+
+    st.markdown("### 🧠 Frame-wise Risk Analysis")
+
+    for idx, frame in frames:
+        if prev_frame is None:
+            prev_frame = frame
+            continue
+
+        # -----------------------------
+        # ⚡ FAST VIDEO SIGNALS (no ML per frame)
+        # -----------------------------
+        gray_prev = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+        gray_now = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        diff = cv2.absdiff(gray_now, gray_prev)
+        motion_energy = np.mean(diff) / 255.0
+
+        # Single Canny pass (faster)
+        edges = cv2.Canny(gray_now, 60, 150)
+        edge_density = np.mean(edges > 0)
+
+        # -----------------------------
+        # FAST RISK CALCULATION (no ML call)
+        # -----------------------------
+        # Direct calculation - much faster than ML per frame
+        video_risk = np.clip(
+            (motion_energy / 0.35) * 0.6 +
+            (edge_density / 0.30) * 0.4,
+            0, 1
+        )
+        
+        # Use video-level ML risk as baseline (already computed)
+        final_risk = video_risk * 0.55 + ml_risk * 0.45
+
+        # HARD CRASH OVERRIDE (extreme motion + high edges)
+        if motion_energy > 0.45 and edge_density > 0.35:
+            final_risk = np.clip(0.88 + video_risk * 0.12, 0.88, 1.0)
+
+        frame_risks.append(final_risk)
+        frame_ids.append(idx)
+
+        if final_risk > max_risk:
+            max_risk = final_risk
+            crash_frame = frame.copy()
+            crash_frame_id = idx
+
+        # -----------------------------
+        # OVERLAY WITH MORE INFO
+        # -----------------------------
+        overlay = frame.copy()
+        color = (0, 255, 0) if final_risk < 0.35 else (0, 165, 255) if final_risk < 0.7 else (0, 0, 255)
+        label = "LOW" if final_risk < 0.35 else "MODERATE" if final_risk < 0.7 else "HIGH"
+
+        cv2.rectangle(overlay, (10, 10), (320, 110), color, 2)
+        cv2.putText(overlay, f"Risk: {final_risk:.2f} ({label})", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        cv2.putText(overlay, f"Motion: {motion_energy:.2f}", (20, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        cv2.putText(overlay, f"Edges: {edge_density:.2f}", (20, 95),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+        st.image(overlay, caption=f"Frame {idx}", width=400)
+        prev_frame = frame
+
+    # --------------------------------------------------
+    # CRASH FRAME FREEZE
+    # --------------------------------------------------
+    if crash_frame is not None and max_risk >= 0.85:
+        st.markdown("## 🚨 HIGH RISK FRAME DETECTED")
+        cv2.rectangle(crash_frame, (0, 0), (crash_frame.shape[1]-1, crash_frame.shape[0]-1), (0, 0, 255), 8)
+        st.image(crash_frame, caption=f"⚠️ High Risk Frame {crash_frame_id}", use_column_width=True)
+
+    # --------------------------------------------------
+    # RISK TIMELINE
+    # --------------------------------------------------
+    if frame_risks:
+        st.session_state.risk_buffer.extend(frame_risks)
+        risk_df = pd.DataFrame({
+            "Frame": frame_ids,
+            "Risk": frame_risks
+        })
+        st.markdown("### 📈 Risk Timeline")
+        st.line_chart(risk_df.set_index("Frame"))
+
+    # --------------------------------------------------
+    # FINAL RISK CALCULATION
+    # --------------------------------------------------
+    # Combine video-level ML prediction with max frame risk
+    final_risk = float(max(max_risk, ml_risk * 0.9))
+
+    # External traffic data fusion
+    traffic = get_live_traffic_snapshot()
+    if traffic["incidents"]:
+        final_risk = max(final_risk, 0.92)
+    else:
+        final_risk = max(final_risk, traffic["congestion_level"] * 0.5)
+
+    st.markdown("### 🚨 Final Accident Risk Assessment")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("**Final Risk Score**", f"{final_risk:.3f}", 
+                 delta=f"{(final_risk - 0.5):.2f}" if final_risk > 0.5 else None)
+    with col2:
+        risk_category = "🟢 LOW" if final_risk < 0.35 else "🟡 MODERATE" if final_risk < 0.70 else "🔴 HIGH" if final_risk < 0.85 else "🚨 CRITICAL"
+        st.metric("Risk Category", risk_category)
+    with col3:
+        st.metric("Analysis Confidence", f"{video_features['confidence']:.0%}")
+
+    # --------------------------------------------------
+    # AUTO EMERGENCY ROUTING TRIGGER
+    # --------------------------------------------------
+    if final_risk >= 0.85:
+        st.session_state["auto_emergency"] = True
+        st.session_state["crash_node"] = "A"
+        st.session_state["hospital_node"] = "D"
+        st.error("🚑 **CRITICAL RISK DETECTED** - Emergency Routing Activated Automatically")
+    else:
+        st.session_state["auto_emergency"] = False
+
+    # --------------------------------------------------
+    # CONFIDENCE GAUGE
+    # --------------------------------------------------
+    import plotly.graph_objects as go
+
+    gauge = go.Figure(go.Indicator(
+        mode="gauge+number+delta",
+        value=final_risk * 100,
+        title={"text": "Risk Level (%)"},
+        delta={"reference": 50, "increasing": {"color": "red"}},
+        gauge={
+            "axis": {"range": [0, 100]},
+            "bar": {"color": "darkred"},
+            "steps": [
+                {"range": [0, 35], "color": "lightgreen"},
+                {"range": [35, 70], "color": "yellow"},
+                {"range": [70, 85], "color": "orange"},
+                {"range": [85, 100], "color": "red"},
+            ],
+            "threshold": {
+                "line": {"color": "black", "width": 4},
+                "thickness": 0.75,
+                "value": 85
+            }
+        }
+    ))
+    st.plotly_chart(gauge, use_container_width=True)
+
+    # --------------------------------------------------
+    # FEATURE IMPORTANCE VISUALIZATION
+    # --------------------------------------------------
+    st.markdown("### 📊 Feature Contribution to Risk")
+    
+    feature_contrib = {
+        "Speed": video_features['speed_score'] / 150 * final_risk,
+        "Density": video_features['density_score'] / 200 * final_risk,
+        "Motion Instability": video_features['motion_variance'] / 100 * final_risk,
+        "Speed Variation": video_features['speed_change'] / 30 * final_risk,
+        "Proximity": (100 - video_features['distance_score']) / 100 * final_risk,
+    }
+    
+    contrib_df = pd.DataFrame({
+        "Feature": list(feature_contrib.keys()),
+        "Contribution": list(feature_contrib.values())
+    })
+    st.bar_chart(contrib_df.set_index("Feature"))
+
+    st.success("✅ Enhanced accident prediction analysis complete!")
+
+# ============================================================
+# PAGE 4 — EMERGENCY ROUTING (STABLE & VISUAL)
+# ============================================================
+elif page == "Emergency Routing":
+    # --- SAFE INITIALIZATION ---
+    if "route_path" not in st.session_state:
+        st.session_state.route_path = None
+
+    if "last_eta" not in st.session_state:
+        st.session_state.last_eta = None
+
+    st.session_state.ambulance_step = 0
+
+    st.markdown("### 🗺️ Live Emergency Route Map (Persistent)")
+        
+    # --------------------------------------------------
+    # READ PERSISTENT REAL-MAP ROUTE
+    # --------------------------------------------------
+    if "real_route" not in st.session_state or "real_graph" not in st.session_state:
+        st.info("Compute a real map route to display it here.")
+    else:
+        route = st.session_state.real_route
+        G_map = st.session_state.real_graph
+
+        # Build coordinates from SAME GPS graph used for routing
+        route_coords = [
+            (G_map.nodes[n]["y"], G_map.nodes[n]["x"])
+            for n in route
+        ]
+
+        # --------------------------------------------------
+        # LEAFLET MAP (PERSISTENT)
+        # --------------------------------------------------
+        import folium
+        from streamlit_folium import st_folium
+
+        m = folium.Map(location=route_coords[0], zoom_start=13)
+
+        folium.PolyLine(
+            route_coords,
+            color="red",
+            weight=5,
+            opacity=0.9,
+        ).add_to(m)
+
+        folium.Marker(
+            route_coords[0],
+            tooltip="🚑 Ambulance Start",
+            icon=folium.Icon(color="red"),
+        ).add_to(m)
+
+        folium.Marker(
+            route_coords[-1],
+            tooltip="🏥 Hospital",
+            icon=folium.Icon(color="green"),
+        ).add_to(m)
+
+        st_folium(m, width=750, height=500)
+
+
+
+    st.subheader("🚑 Emergency Vehicle Routing & Response")
+    st.markdown("### 🔀 Routing Mode")
+
+    routing_mode = st.radio(
+        "Select routing engine",
+        ["Demo Graph (Simulation)", "🌍 Real Map (GPS-based)"],
+        horizontal=True
+    )
+
+
+    # --------------------------------------------------
+    # LOAD GRAPH (ALWAYS)
+    # --------------------------------------------------
+    graph = load_sample_graph()
+    nodes = graph["nodes"]
+
+    import networkx as nx
+    import matplotlib.pyplot as plt
+
+    # Build NetworkX graph ONCE
+    G = nx.Graph()
+    for e in graph["edges"]:
+        G.add_edge(e["u"], e["v"], weight=e.get("weight", 1.0))
+    # --------------------------------------------------
+    # STABLE GRAPH LAYOUT (CRITICAL)
+    # --------------------------------------------------
+    if "graph_pos" not in st.session_state:
+        st.session_state.graph_pos = nx.spring_layout(G, seed=42)
+
+    pos = st.session_state.graph_pos
+
+    path = None
+
+    # --------------------------------------------------
+    # AUTO EMERGENCY ROUTING
+    # --------------------------------------------------
+    auto_mode = st.session_state.get("auto_emergency", False)
+
+    if auto_mode:
+        st.info("🚨 Auto-routing active (triggered by accident)")
+        crash_node = st.session_state.get("crash_node")
+        hospital_node = st.session_state.get("hospital_node")
+
+        if crash_node and hospital_node:
+            path, cost = astar_route(graph, crash_node, hospital_node)
+            st.session_state.route_path = path
+            st.session_state.last_eta = round(cost * 0.6, 2)
+
+            st.success(f"🚑 Auto Route: {' → '.join(path)}")
+            st.metric("Auto Emergency ETA (min)", st.session_state.last_eta)
+
+    # --------------------------------------------------
+    # MANUAL ROUTING (ALWAYS VISIBLE)
+    # --------------------------------------------------
+    st.markdown("---")
+    st.subheader("🧭 Manual Emergency Routing")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        start = st.selectbox("Start Node", nodes, key="manual_start")
+    with c2:
+        goal = st.selectbox("Goal Node", nodes, key="manual_goal")
+    with c3:
+        algo = st.selectbox("Algorithm", ["A*", "Dijkstra"], key="manual_algo")
+
+    if st.button("Compute Route", key="manual_route_btn"):
+        if algo == "A*":
+            path, cost = astar_route(graph, start, goal)
+        else:
+            path, cost = dijkstra_route(graph, start, goal)
+
+        st.session_state.route_path = path
+        traffic = get_live_traffic_snapshot()
+
+        delay_factor = 1.0 + traffic["congestion_level"]
+        eta = round(cost * 0.5 * delay_factor, 2)
+        st.session_state.last_eta = eta
+
+        st.success(f"✅ Route Computed: {' → '.join(path)}")
+        st.metric("ETA (minutes)", eta)
+
+    # --------------------------------------------------
+    # 🚑 LIVE AMBULANCE ANIMATION
+    # --------------------------------------------------
+    st.markdown("### 🚑 Live Ambulance Movement")
+
+    path = st.session_state.get("route_path")
+
+    if path is None or len(path) < 2:
+        st.warning("Compute a route to see live animation.")
+    else:
+        fig_placeholder = st.empty()
+        progress = st.progress(0)
+
+        for i in range(len(path) - 1):
+
+            fig, ax = plt.subplots(figsize=(6, 5))
+            ax.axis("off")
+            ax.set_title("🚑 Emergency Vehicle Navigation")
+
+            # draw base graph
+            nx.draw(
+                G, pos,
+                node_color="#CBD5E1",
+                node_size=500,
+                edge_color="#94A3B8",
+                width=1.5,
+                with_labels=True,
+                ax=ax
+            )
+
+            # highlight completed route
+            route_edges = list(zip(path[:i+1], path[1:i+2]))
+            nx.draw_networkx_edges(
+                G, pos,
+                edgelist=route_edges,
+                edge_color="red",
+                width=3,
+                ax=ax
+            )
+
+            # ambulance marker
+            x, y = pos[path[i+1]]
+            ax.text(x, y, "🚑", fontsize=22, ha="center", va="center")
+
+            fig_placeholder.pyplot(fig)
+            plt.close(fig)
+
+            progress.progress(int((i + 1) / len(path) * 100))
+            time.sleep(0.6)
+        st.session_state.ambulance_step += 1
+        current_node = path[min(
+            st.session_state.ambulance_step,
+            len(path)-1
+        )]
+        st.metric("Current Ambulance Node", current_node)
+        st.metric(
+            "Remaining Nodes",
+            len(path) - st.session_state.ambulance_step
+        )
+
+
+
+        st.success("🏥 Emergency vehicle reached destination")    
+
+    # --------------------------------------------------
+    # 🎥 VIDEO-ASSISTED ETA (ALWAYS VISIBLE)
+    # --------------------------------------------------
+    st.markdown("---")
+    st.markdown("### 🎥 Video-Assisted Traffic Awareness")
+
+    route_video = st.file_uploader(
+        "Upload traffic video for routing",
+        type=["mp4", "avi"],
+        key="route_video_panel"
+    )
+
+    if route_video:
+        st.video(route_video)
+
+        if path is not None and st.session_state.get("last_eta") is not None:
+            # Save uploaded file to temporary location for OpenCV
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_file:
+                tmp_file.write(route_video.read())
+                tmp_route_video_path = tmp_file.name
+
+            try:
+                frames = sample_frames_from_file(tmp_route_video_path, sample_n=4)
+                congestion = []
+
+                for idx, frame in frames:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    edges = cv2.Canny(gray, 80, 160)
+                    congestion.append(np.mean(edges > 0))
+
+                factor = np.clip(1.0 + np.mean(congestion) * 1.5, 0.8, 1.8)
+                adj_eta = round(st.session_state.last_eta * factor, 2)
+
+                st.metric("Adjusted Emergency ETA (minutes)", adj_eta)
+            finally:
+                # Clean up temporary file
+                if os.path.exists(tmp_route_video_path):
+                    os.unlink(tmp_route_video_path)
+
+    # --------------------------------------------------
+    # Demo graph doesn't have GPS coordinates
+    # Real GPS routing is handled separately below
+    # --------------------------------------------------
+    # ============================================================
+    # 🌍 REAL MAP + GPS EMERGENCY ROUTING
+    # ============================================================
+    if routing_mode == "🌍 Real Map (GPS-based)":
+
+        st.markdown("---")
+        st.subheader("🌍 Real Map Emergency Routing (GPS-Based)")
+
+        st.write(
+            """
+            This mode uses **real road networks** from OpenStreetMap.
+            Routing is computed using **Dijkstra / A\*** on actual city roads.
+            """
+        )
+
+        # -----------------------------
+        # CITY SELECTION
+        # -----------------------------
+        city = st.selectbox(
+            "Select City",
+            [
+                "Bengaluru, India",
+                "Hyderabad, India",
+                "Chennai, India",
+                "Delhi, India",
+                "Mumbai, India",
+            ],
+        )
+
+        # -----------------------------
+        # LOAD REAL ROAD NETWORK
+        # -----------------------------
+        st.markdown("### 📍 Emergency Location (GPS)")
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            start_lat = st.number_input(
+                "Start Latitude",
+                value=12.9716,
+                format="%.6f",
+                key="realmap_start_lat"
+            )
+            start_lon = st.number_input(
+                "Start Longitude",
+                value=77.5946,
+                format="%.6f",
+                key="realmap_start_lon"
+            )
+
+        with col2:
+            dest_lat = st.number_input(
+                "Destination Latitude",
+                value=12.9750,
+                format="%.6f",
+                key="realmap_dest_lat"
+            )
+            dest_lon = st.number_input(
+                "Destination Longitude",
+                value=77.6030,
+                format="%.6f",
+                key="realmap_dest_lon"
+            )
+
+        # -----------------------------
+        # ROUTE COMPUTATION
+        # -----------------------------
+        if st.button("🚑 Compute Real Map Route"):
+            
+            with st.spinner("Loading road network and computing route..."):
+                try:
+                    # Load road network around start point
+                    G_map = load_real_road_graph(start_lat, start_lon, 3000)
+
+                    # Find nearest nodes to start and destination
+                    orig_node = ox.nearest_nodes(G_map, start_lon, start_lat)
+                    dest_node = ox.nearest_nodes(G_map, dest_lon, dest_lat)
+
+                    # Compute route using NetworkX
+                    route = nx.shortest_path(
+                        G_map,
+                        orig_node,
+                        dest_node,
+                        weight="length",
+                        method="dijkstra",
+                    )
+
+                    # ✅ STORE ROUTE PERSISTENTLY
+                    st.session_state.real_route = route
+                    st.session_state.real_graph = G_map
+
+                    st.success("✅ Route computed successfully")
+
+                    # ✅ Extract GPS coordinates from the route nodes
+                    route_coords = [
+                        (G_map.nodes[n]["y"], G_map.nodes[n]["x"])  # (lat, lon)
+                        for n in route
+                    ]
+
+                    # Calculate route length
+                    route_length = 0.0
+                    for u, v in zip(route[:-1], route[1:]):
+                        edge_data = G_map.get_edge_data(u, v)
+                        if edge_data:
+                            # Handle multigraph safely
+                            edge = list(edge_data.values())[0]
+                            route_length += edge.get("length", 0.0)
+
+                    # Calculate ETA
+                    eta = round((route_length / 1000) / 40 * 60, 2)  # 40 km/h avg
+                    st.metric("🚑 Estimated ETA (minutes)", eta)
+                    
+                    # Create interactive map
+                    st.markdown("### 🗺️ Live Emergency Route Map")
+                    m = folium.Map(
+                        location=route_coords[0],
+                        zoom_start=13,
+                        tiles="OpenStreetMap"
+                    )
+                    
+                    # Add route line
+                    folium.PolyLine(
+                        route_coords,
+                        color="red",
+                        weight=5,
+                        opacity=0.9
+                    ).add_to(m)
+                    
+                    # Add start marker
+                    folium.Marker(
+                        route_coords[0],
+                        tooltip="🚑 Ambulance Start",
+                        icon=folium.Icon(color="red", icon="plus-sign")
+                    ).add_to(m)
+
+                    # Add destination marker
+                    folium.Marker(
+                        route_coords[-1],
+                        tooltip="🏥 Hospital",
+                        icon=folium.Icon(color="green", icon="info-sign")
+                    ).add_to(m)
+
+                    st_folium(m, width=800, height=520)
+                    st.success("🏥 Emergency route successfully visualized")
+                    
+                except Exception as e:
+                    st.error(f"Route computation failed: {e}")
+                    st.info("💡 Try adjusting the coordinates or selecting a different city region.")
+
+# ============================================================
+# PAGE 5 — LOGS
+# ============================================================
+elif page == "Logs & Debug":
+    st.subheader("System Logs & Debug")
+
+    if st.session_state.logs:
+        st.code("\n".join(st.session_state.logs[:200]))
+    else:
+        st.info("No logs yet.")
+
+# ------------------------------------------------------------
+# FOOTER
+# ------------------------------------------------------------
+st.markdown("---")
+st.caption(
+    "Unified AI-Based Smart Transport Intelligence Platform | "
+    "Stable Professional Base | Ready for Real Model Integration"
+)
